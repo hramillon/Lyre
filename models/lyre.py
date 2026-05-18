@@ -11,8 +11,8 @@ from torch.backends.cuda import sdp_kernel
 """
 Listes des améliorations pour la seconde version de Lyre :
     - augmentation data 14Go -> 19.2
-    - RoPE pour remplacer pos_emb d'autant plus important pour du RAG qui demande une window size assez élevée
-    - RMSNorm remplacer à partir de GPT3 il me semble
+    - RoPE pour remplacer pos_emb d'autant plus important pour du RAG qui demande une window size assez élevée pendant à l'inférence (fait)
+    - RMSNorm remplacer à partir de GPT3 il me semble (fait)
     - SwiGLU (à essayer de comprendr eun peu plus pour voir si utile)
     - Gradient checkpointing
 
@@ -119,6 +119,19 @@ dist.barrier(device_ids=[local_rank])
 # =============================================================================
 
 # ---------------
+# RMSNorm
+# ---------------
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * rms * self.weight
+
+# ---------------
 # RoPE
 # ---------------
 #head = 64
@@ -185,9 +198,9 @@ class TransformerBlock(nn.Module):
         super().__init__()
         # on prépare les layers
         #attention
-        self.ln1, self.attn = nn.LayerNorm(embed_dim, eps=1e-5), CausalSelfAttention(embed_dim, n_heads, dropout)
+        self.ln1, self.attn = RMSNorm(embed_dim), CausalSelfAttention(embed_dim, n_heads, dropout)
         # MLP
-        self.ln2, self.ffn = nn.LayerNorm(embed_dim, eps=1e-5), nn.Sequential(nn.Linear(embed_dim, ff_dim), nn.GELU(), nn.Linear(ff_dim, embed_dim), nn.Dropout(dropout))
+        self.ln2, self.ffn = RMSNorm(embed_dim), nn.Sequential(nn.Linear(embed_dim, ff_dim), nn.GELU(), nn.Linear(ff_dim, embed_dim), nn.Dropout(dropout))
     def forward(self, x):
         # Calcul de l'attention sur l'entrée normalisée
         x = x + self.attn(self.ln1(x))
@@ -203,7 +216,7 @@ class Lyre(nn.Module):
         # block transformer 16 layers
         self.blocks = nn.ModuleList([TransformerBlock(embed_dim, n_heads, ff_dim, dropout) for _ in range(n_blocks)])
         # normalisation  + MLP
-        self.ln_f, self.head = nn.LayerNorm(embed_dim, eps=1e-5), nn.Linear(embed_dim, vocab_size, bias=False)
+        self.ln_f, self.head = RMSNorm(embed_dim), nn.Linear(embed_dim, vocab_size, bias=False)
         self.head.weight = self.token_emb.weight
         #def cos et sin
         cos, sin = precompute_rope(embed_dim // n_heads, max_len)
