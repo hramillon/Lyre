@@ -8,7 +8,20 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from torch.backends.cuda import sdp_kernel
+"""
+Listes des améliorations pour la seconde version de Lyre :
+    - augmentation data 14Go -> 19.2
+    - RoPE pour remplacer pos_emb d'autant plus important pour du RAG qui demande une window size assez élevée
+    - RMSNorm remplacer à partir de GPT3 il me semble
+    - SwiGLU (à essayer de comprendr eun peu plus pour voir si utile)
+    - Gradient checkpointing
 
+    - Il me semble que possibilité de compresser les gradients pour gaganer du temps sur réseau = PowerSGD
+
+    à voir ce que Claude m'a dit (pas forcemment de bon conseil)
+    - sdp_kernel est deprecié est ce que cela a un réel impact ?
+    -
+"""
 # FIX SYSTEME
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -31,6 +44,8 @@ DROPOUT          = 0.1
 # 14-20 Go is sufficient I don't want the model to overfit. However cuz there is a lot of data we can maybe try a second epoch to slightly increase the results without ouverfit
 EPOCHS           = 1
 """
+dans version 2 en réalité c'est aussi utilse que ce que je pensais, aucune amélioration visible
+
 à absolument faire sur les trois machines 
 mkdir -p /tmp/checkpoint
 
@@ -95,13 +110,47 @@ def make_dataloader(dataset, batch_size, world_size, rank):
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=0, pin_memory=True), sampler
 
-#14Go, 1024 , 30074
+#14Go, 1024 , 32768
 dataset = CorpusDataset(BIN_FILE, MAX_LEN, VOCAB_SIZE)
 dist.barrier(device_ids=[local_rank])
 
 # =============================================================================
 # MODÈLE
 # =============================================================================
+
+# ---------------
+# RoPE
+# ---------------
+#head = 64
+def precompute_rope(head_dim, max_len, base=10000, device=None):
+    # une fréquence theta par paire de dimensions
+    theta = 1.0 / (base ** (
+        torch.arange(0, head_dim, 2, device=device).float() / head_dim
+    ))
+    # toutes les positions
+    positions = torch.arange(max_len, device=device).float()
+    # matrice (max_len, head_dim//2) — angle de chaque position/dimension
+    freqs = torch.outer(positions, theta)
+    return freqs.cos(), freqs.sin()
+
+def apply_rope(x, cos, sin):
+    # x shape : (B, n_heads, T, head_dim)
+    T = x.shape[2]
+    # on prend les positions nécessaires
+    cos, sin = cos[:T], sin[:T]
+
+    # sépare les paires de dimensions
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+
+    # rotation 2D
+    x_rot = torch.stack([
+        x1 * cos - x2 * sin,
+        x1 * sin + x2 * cos
+    ], dim=-1)
+
+    return x_rot.flatten(-2) 
+
 # casual masque le futur (génération de texte)
 class CausalSelfAttention(nn.Module):
     def __init__(self, embed_dim, n_heads, dropout=0.1):
@@ -112,7 +161,7 @@ class CausalSelfAttention(nn.Module):
         # le proj concatène les résultats des différentes couches d'attention
         # dropout basique, régularisation simple en 0.1
         self.qkv, self.proj, self.drop = nn.Linear(embed_dim, 3 * embed_dim, bias=False), nn.Linear(embed_dim, embed_dim), nn.Dropout(dropout)
-    def forward(self, x):
+    def forward(self, x, cos, sin):
         # tenseur d'entrée x , divisée par son B(atch size) T(ime) =1024 C(hannel 1024)
         B, T, C = x.shape
         # créer des vues différentes pour Query, Key, View
@@ -121,6 +170,11 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+        #RoPE
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+
         # calcul en parallèle on multiplie la matrice q par la transposée k / on applique le  masque triangulaire inférieure
         ## Softmax ( Q.k^{T}/sqrt(d_k) + M) * V ou M est le masque causal et d_k = head dim = embed_dim//n_head  = 64
         out = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=self.drop.p if self.training else 0.0, is_causal=True)
@@ -143,14 +197,18 @@ class TransformerBlock(nn.Module):
 class Lyre(nn.Module):
     def __init__(self, vocab_size, max_len, embed_dim, n_heads, ff_dim, n_blocks, dropout=0.1):
         super().__init__()
-        # token_emb : 30074 * 1024 pos_emb : 1024 * 1024
-        self.token_emb, self.pos_emb = nn.Embedding(vocab_size, embed_dim), nn.Embedding(max_len, embed_dim)
+        # token_emb : 32768 * 1024 pos_emb : 1024 * 1024
+        self.token_emb = nn.Embedding(vocab_size, embed_dim)
         self.drop = nn.Dropout(dropout)
         # block transformer 16 layers
         self.blocks = nn.ModuleList([TransformerBlock(embed_dim, n_heads, ff_dim, dropout) for _ in range(n_blocks)])
         # normalisation  + MLP
         self.ln_f, self.head = nn.LayerNorm(embed_dim, eps=1e-5), nn.Linear(embed_dim, vocab_size, bias=False)
         self.head.weight = self.token_emb.weight
+        #def cos et sin
+        cos, sin = precompute_rope(embed_dim // n_heads, max_len)
+        self.register_buffer("cos", cos)
+        self.register_buffer("sin", sin)
         self._init_weights()
     def _init_weights(self):
         # papier original de GPT2 on initalise selon une loi normale centrée réduite ajustée N(0,0.02²)
@@ -205,7 +263,8 @@ for epoch in range(EPOCHS):
     
     for step_in_epoch, (x, y) in enumerate(loader):
         # Reprise exacte : on skip les batchs déjà vus
-        if step_in_epoch < (start_step % len(loader)):
+        global_step = epoch * len(loader) + step_in_epoch
+        if global_step < start_step:
             continue
 
         is_sync_step = (step_in_epoch + 1) % ACCUM_STEPS == 0
@@ -222,17 +281,18 @@ for epoch in range(EPOCHS):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
             
             if is_chief:
                 current_total_step = epoch * len(loader) + step_in_epoch
                 current_loss_val = loss.item() * ACCUM_STEPS
                 
                 elapsed = time.time() - t_start
-                # Speed basée sur les steps réellement effectués cette session
-                steps_done_session = (step_in_epoch - (start_step % len(loader))) + 1
-                speed = elapsed / steps_done_session
-                eta = (total_steps - current_total_step) * speed
-                
+                steps_done_session = current_total_step - start_step + 1  # steps réels cette session
+                speed = elapsed / steps_done_session if steps_done_session > 0 else 0
+                remaining_steps = total_steps - current_total_step
+                eta = remaining_steps * speed
+
                 print(f"Step {current_total_step}/{total_steps} | Loss: {current_loss_val:.4f} | Passé: {time.strftime('%H:%M:%S', time.gmtime(elapsed))} | ETA: {time.strftime('%H:%M:%S', time.gmtime(eta))}")
 
                 # SAUVEGARDE CONDITIONNELLE : Intervalle + Meilleure Loss à améliorer pas assezd e sauvegarde en fin d'entrainement
@@ -247,6 +307,5 @@ for epoch in range(EPOCHS):
                     }, RESUME_PATH)
                     print(f" >> [SAVE] Nouveau best à {best_loss:.4f} au step {step_in_epoch}")
 
-                optimizer.zero_grad(set_to_none=True)
 
 dist.destroy_process_group()
