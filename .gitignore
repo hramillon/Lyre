@@ -1,0 +1,11 @@
+checkpoint/
+*.bin
+logs/
+ressources/*.json
+ressources/*.jsonl
+ressources/*.bin
+token/*.json
+venv/
+__pycache__/
+*.pyc
+.DS_Store
