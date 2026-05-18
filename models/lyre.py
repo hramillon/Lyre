@@ -4,23 +4,46 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
-from torch.backends.cuda import sdp_kernel
+from torch.nn.attention import sdpa_kernel, SDPBackend
+from torch.utils.checkpoint import checkpoint
+from torch.distributed.algorithms.ddp_comm_hooks import powerSGD_hook as powerSGD
+
 """
 Listes des améliorations pour la seconde version de Lyre :
     - augmentation data 14Go -> 19.2
     - RoPE pour remplacer pos_emb d'autant plus important pour du RAG qui demande une window size assez élevée pendant à l'inférence (fait)
     - RMSNorm remplacer à partir de GPT3 il me semble (fait)
-    - SwiGLU (à essayer de comprendr eun peu plus pour voir si utile)
-    - Gradient checkpointing
+    - SwiGLU (fait)
+    - Gradient checkpointing (à faire pour baisser la VRAM)
+    - GQA pour gagner en ram + faire plus de têtes ?
 
     - Il me semble que possibilité de compresser les gradients pour gaganer du temps sur réseau = PowerSGD
 
     à voir ce que Claude m'a dit (pas forcemment de bon conseil)
     - sdp_kernel est deprecié est ce que cela a un réel impact ?
-    -
+    
+    grep "use_gradient_checkpointing" models/lyre.py
+
+    find . -name "*.pyc" -delete
+    find . -name "__pycache__" -delete
+
+    [rank0]: Traceback (most recent call last):
+[rank0]:   File "/autofs/unitytravail/travail/hramillon/prog/Lyre/models/lyre.py", line 94, in <module>
+[rank0]:     total = sum(p.numel() for p in model.parameters())
+[rank0]:                                    ^^^^^
+[rank0]: NameError: name 'model' is not defined
+[rank0]:[W518 19:14:33.160986117 ProcessGroupNCCL.cpp:1250] Warning: WARNING: process group has NOT been destroyed before we destruct ProcessGroupNCCL. On normal program exit, the application should call destroy_process_group to ensure that any pending NCCL operations have finished in this process. In rare cases this process can exit before this point and block the progress of another member of the process group. This constraint has always been present,  but this warning has only been added since PyTorch 2.4 (function operator())
+E0518 19:14:34.007000 298846 torch/distributed/elastic/multiprocessing/api.py:869] failed (exitcode: 1) local_rank: 0 (pid: 298890) of binary: /autofs/unitytravail/travail/hramillon/prog/Lyre/venv/bin/python3
+Traceback (most recent call last):
+
+
+torchrun --nproc_per_node=1 --nnodes=3 --node_rank=0 --rdzv_id=lyre --rdzv_backend=c10d --rdzv_endpoint=10.0.104.4:29505 models/lyre.py 2>&1 | tee train.log
+
+cat train.log
 """
 # FIX SYSTEME
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -38,11 +61,12 @@ EMBEDDING_DIM    = 1024
 # 16 layers 16 heads
 N_BLOCKS         = 16
 N_HEADS          = 16
-# 4 * 1024 by convention
-FEED_FORWARD_DIM = 4096
+FEED_FORWARD_DIM = 2752
 DROPOUT          = 0.1
-# 14-20 Go is sufficient I don't want the model to overfit. However cuz there is a lot of data we can maybe try a second epoch to slightly increase the results without ouverfit
+# 14-20 Go is sufficient I don't want the model to overfit. However cuz there is a lot of data we can maybe try a second epoch to slightly increase the results
 EPOCHS           = 1
+# pour le grouped Query Attention
+N_KV_HEADS = 4
 """
 dans version 2 en réalité c'est aussi utilse que ce que je pensais, aucune amélioration visible
 
@@ -57,23 +81,22 @@ cp corpus_encoded.bin /tmp/corpus_encoded.bin
 cp /tmp/checkpoint/latest_best.pt checkpoint/latest_best.pt
 
 torchrun --nproc_per_node=1 --nnodes=3 --node_rank=0 --rdzv_id=lyre --rdzv_backend=c10d --rdzv_endpoint=10.0.104.4:29505 models/lyre.py
-
+fuser -k 29505/tcp
 """
-BIN_FILE         = "/tmp/corpus_encoded.bin"
-MODEL_SAVE_DIR   = "/tmp/checkpoint"
-# memory issues 20go for 8 by gpus is too small
-BATCH_SIZE_PER_GPU = 8
+BIN_FILE         = "ressources/corpus_encoded.bin"
+MODEL_SAVE_DIR   = "checkpoint/"
+# memory issues ,20go for 8 by gpus is too small
+BATCH_SIZE_PER_GPU = 16
 # by increasing BATCH_SIZE_PER_GPU we should decrease it to prevent the models to diverge
-ACCUM_STEPS      = 128 
+ACCUM_STEPS      = 32 
 
 SAVE_EVERY       = 10 * ACCUM_STEPS 
-RESUME_PATH      = os.path.join(MODEL_SAVE_DIR, "latest_best.pt")
+RESUME_PATH      = os.path.join(MODEL_SAVE_DIR, "latest_best2.pt")
 
 # =============================================================================
 # INIT DDP (NCCL)
 # =============================================================================
 
-## !! power SGD à mettre en oeuvre pour le second modèle de Lyre, ethernet empêche de baisser le ACCUM_STEPS   !!
 ## mettre un schéma du modèle avant le lancement afin de maitriser le nombre de param du modèle.
 local_rank = int(os.environ["LOCAL_RANK"])
 dist.init_process_group(backend="nccl")
@@ -110,13 +133,29 @@ def make_dataloader(dataset, batch_size, world_size, rank):
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=0, pin_memory=True), sampler
 
-#14Go, 1024 , 32768
+#19Go, 1024 , 32768
 dataset = CorpusDataset(BIN_FILE, MAX_LEN, VOCAB_SIZE)
 dist.barrier(device_ids=[local_rank])
 
 # =============================================================================
 # MODÈLE
 # =============================================================================
+
+
+# ---------------
+# SwiGLU
+# ---------------
+
+class SwiGLU(nn.Module):
+    def __init__(self, embed_dim, ff_dim, dropout=0.1):
+        super().__init__()
+        self.w1 = nn.Linear(embed_dim, ff_dim, bias=False)
+        self.w2 = nn.Linear(embed_dim, ff_dim, bias=False)
+        self.w3 = nn.Linear(ff_dim, embed_dim, bias=False)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.drop(self.w3(F.silu(self.w1(x)) * self.w2(x)))
 
 # ---------------
 # RMSNorm
@@ -142,7 +181,7 @@ def precompute_rope(head_dim, max_len, base=10000, device=None):
     ))
     # toutes les positions
     positions = torch.arange(max_len, device=device).float()
-    # matrice (max_len, head_dim//2) — angle de chaque position/dimension
+    # matrice (max_len, head_dim//2) angle de chaque position/dimension
     freqs = torch.outer(positions, theta)
     return freqs.cos(), freqs.sin()
 
@@ -164,7 +203,7 @@ def apply_rope(x, cos, sin):
 
     return x_rot.flatten(-2) 
 
-# casual masque le futur (génération de texte)
+# casual masque les mots futurs (génération de texte)
 class CausalSelfAttention(nn.Module):
     def __init__(self, embed_dim, n_heads, dropout=0.1):
         super().__init__()
@@ -200,17 +239,17 @@ class TransformerBlock(nn.Module):
         #attention
         self.ln1, self.attn = RMSNorm(embed_dim), CausalSelfAttention(embed_dim, n_heads, dropout)
         # MLP
-        self.ln2, self.ffn = RMSNorm(embed_dim), nn.Sequential(nn.Linear(embed_dim, ff_dim), nn.GELU(), nn.Linear(ff_dim, embed_dim), nn.Dropout(dropout))
-    def forward(self, x):
+        self.ln2, self.ffn = RMSNorm(embed_dim),SwiGLU(embed_dim, ff_dim, dropout)
+    def forward(self, x,cos, sin):
         # Calcul de l'attention sur l'entrée normalisée
-        x = x + self.attn(self.ln1(x))
+        x = x + self.attn(self.ln1(x), cos, sin)
         # Calcul du FFN sur l'entrée normalisée
         return x + self.ffn(self.ln2(x))
 
 class Lyre(nn.Module):
-    def __init__(self, vocab_size, max_len, embed_dim, n_heads, ff_dim, n_blocks, dropout=0.1):
+    def __init__(self, vocab_size, max_len, embed_dim, n_heads, ff_dim, n_blocks, dropout=0.1, use_gradient_checkpointing=True):
         super().__init__()
-        # token_emb : 32768 * 1024 pos_emb : 1024 * 1024
+        # token_emb : 32768 * 1024 pos_emb : remplacé par RoPE
         self.token_emb = nn.Embedding(vocab_size, embed_dim)
         self.drop = nn.Dropout(dropout)
         # block transformer 16 layers
@@ -222,6 +261,8 @@ class Lyre(nn.Module):
         cos, sin = precompute_rope(embed_dim // n_heads, max_len)
         self.register_buffer("cos", cos)
         self.register_buffer("sin", sin)
+        #gain VRAM
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         self._init_weights()
     def _init_weights(self):
         # papier original de GPT2 on initalise selon une loi normale centrée réduite ajustée N(0,0.02²)
@@ -231,37 +272,90 @@ class Lyre(nn.Module):
         # entrée  = Batch * Time
         B, T = idx.shape
         # dropout sur la somme de mes embeddings donc sémantique du mot + position
-        x = self.drop(self.token_emb(idx) + self.pos_emb(torch.arange(T, device=idx.device)))
-        for block in self.blocks: x = block(x)
+        x = self.drop(self.token_emb(idx))
+        for block in self.blocks:
+            if self.use_gradient_checkpointing and self.training:
+                x = checkpoint(block, x, self.cos, self.sin, use_reentrant=False)
+            else:
+                x = block(x, self.cos, self.sin)
+
         return self.head(self.ln_f(x))
 
 # =============================================================================
 # SETUP & REPRISE
 # =============================================================================
 # créer norte modèle
-model = Lyre(VOCAB_SIZE, MAX_LEN, EMBEDDING_DIM, N_HEADS, FEED_FORWARD_DIM, N_BLOCKS, DROPOUT).to(device)
-# distributed data parallel pour entrainer sur plusieurs PC gradient dans des paquets de 25Mo
-model = DDP(model, device_ids=[local_rank], bucket_cap_mb=25)
+model = Lyre(
+    VOCAB_SIZE, MAX_LEN, EMBEDDING_DIM, N_HEADS,
+    FEED_FORWARD_DIM, N_BLOCKS, DROPOUT,
+    use_gradient_checkpointing=True
+).to(device)
+
+if is_chief:
+    total = sum(p.numel() for p in model.parameters())
+    print(f"[ARCH] Paramètres: {total/1e6:.1f}M")
+    print(f"[ARCH] Layers: {N_BLOCKS} | Heads: {N_HEADS} | Embed: {EMBEDDING_DIM} | FF: {FEED_FORWARD_DIM}")
+
+# distributed data parallel pour entrainer sur plusieurs PC gradient dans des paquets de 50Mo pour que PowerSgd soit efficace
+model = DDP(model, device_ids=[local_rank], bucket_cap_mb=50)
+
+powersgd_state = powerSGD.PowerSGDState(
+    process_group=dist.group.WORLD,
+    matrix_approximation_rank=4,
+    warm_start=True,
+    use_error_feedback=True,
+    start_powerSGD_iter=100,
+    min_compression_rate=2.0,
+)
+
+model.register_comm_hook(
+    state=powersgd_state,
+    hook=powerSGD.powerSGD_hook,
+)
+
+
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1)
 # assure aucun chevauchement entre ordinateurs
 loader, sampler = make_dataloader(dataset, BATCH_SIZE_PER_GPU, world_size, rank)
 # scheduler avec courbe cosinus 
-scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: (s/1000 if s < 1000 else 0.5 * (1.0 + math.cos(math.pi * (s-1000)/( (len(loader)*EPOCHS)-1000)))))
+scheduler = torch.optim.lr_scheduler.LambdaLR(
+    optimizer,
+    lambda s: (
+        s / 1000 if s < 1000
+        else 0.5 * (1.0 + math.cos(
+            math.pi * (s - 1000) / ((len(loader) * EPOCHS) - 1000)
+        ))
+    )
+)
+
 loss_fn = nn.CrossEntropyLoss()
 
 start_step = 0
 best_loss = float('inf')
 
-# reprise de l'netrainement
+# reprise de l'entrainement
 if os.path.exists(RESUME_PATH):
     map_location = {'cuda:%d' % 0: 'cuda:%d' % local_rank}
     checkpoint = torch.load(RESUME_PATH, map_location=map_location)
+    
     model.module.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    start_step = checkpoint['step'] + 1 
-    best_loss = checkpoint['loss']
-    if is_chief: print(f"[INFO] Resume au step {start_step} (Loss: {best_loss:.4f})")
+    start_step = checkpoint['step'] + 1
+    best_loss  = checkpoint['loss']
+
+    # PowerSGD
+    if 'powersgd_iter' in checkpoint:
+        powersgd_state.iter = checkpoint['powersgd_iter']
+        if checkpoint['powersgd_p']:
+            for p_saved, p_curr in zip(checkpoint['powersgd_p'], powersgd_state.p_memory_dict.values()):
+                p_curr.copy_(p_saved.to(device))
+        if checkpoint['powersgd_q']:
+            for q_saved, q_curr in zip(checkpoint['powersgd_q'], powersgd_state.q_memory_dict.values()):
+                q_curr.copy_(q_saved.to(device))
+
+    if is_chief:
+        print(f"[INFO] Resume au step {start_step} (Loss: {best_loss:.4f})")
 
 # =============================================================================
 # TRAIN
@@ -285,8 +379,9 @@ for epoch in range(EPOCHS):
 
         with context:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                with sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
-                    loss = loss_fn(model(x.to(device, non_blocking=True)).view(-1, VOCAB_SIZE), y.to(device, non_blocking=True).view(-1))
+                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):                    
+                    logits = model(x.to(device, non_blocking=True))
+                    loss = loss_fn(logits.view(-1, VOCAB_SIZE), y.to(device, non_blocking=True).view(-1))
                     loss = loss / ACCUM_STEPS
             loss.backward()
         
@@ -306,9 +401,14 @@ for epoch in range(EPOCHS):
                 remaining_steps = total_steps - current_total_step
                 eta = remaining_steps * speed
 
-                print(f"Step {current_total_step}/{total_steps} | Loss: {current_loss_val:.4f} | Passé: {time.strftime('%H:%M:%S', time.gmtime(elapsed))} | ETA: {time.strftime('%H:%M:%S', time.gmtime(eta))}")
+                print(
+                    f"Step {current_total_step}/{total_steps} | "
+                    f"Loss: {current_loss_val:.4f} | "
+                    f"Passé: {time.strftime('%H:%M:%S', time.gmtime(elapsed))} | "
+                    f"ETA: {time.strftime('%H:%M:%S', time.gmtime(eta))}"
+                )
 
-                # SAUVEGARDE CONDITIONNELLE : Intervalle + Meilleure Loss à améliorer pas assezd e sauvegarde en fin d'entrainement
+                # SAUVEGARDE CONDITIONNELLE : Intervalle + Meilleure Loss à améliorer pas assez de sauvegarde en fin d'entrainement
                 if (step_in_epoch + 1) % SAVE_EVERY == 0 and current_loss_val < best_loss:
                     best_loss = current_loss_val
                     torch.save({
@@ -317,6 +417,11 @@ for epoch in range(EPOCHS):
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict(),
                         'loss': best_loss,
+                        'powersgd_p': [p.cpu() for p in powersgd_state.p_memory_dict.values()],
+                        # Pareil pour Q
+                        'powersgd_q': [q.cpu() for q in powersgd_state.q_memory_dict.values()],
+                        # Le compteur de steps PowerSGD
+                        'powersgd_iter': powersgd_state.iter,
                     }, RESUME_PATH)
                     print(f" >> [SAVE] Nouveau best à {best_loss:.4f} au step {step_in_epoch}")
 
