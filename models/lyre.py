@@ -13,46 +13,34 @@ from torch.utils.checkpoint import checkpoint
 from torch.distributed.algorithms.ddp_comm_hooks import powerSGD_hook as powerSGD
 
 """
+L'objectif principale pour la seconde version de Lyre et quelle ait une meilleure perplexité pour éviter avoir des phrases plus cohérentes. d'après mes recerches rajouter des parametres n'est clairement pas suffisant( il faudrait en rajouter beaucoup ) soit dit en passant on peut augmenter la quantité de donnée sur laquelle est entrainée l'IA on passe donc de 14 à 20Go de données on peut aussi penser à soit faire une autre epoch soit entrainée sur en plus du opensubttles + une partie de CulturaX que je n'ai pas telechargé en français.
+le second objectif est d'être plus souple sur la window size ce que le mécanisme RoPE permet ce qui permettre d'améliorer l'efficatcité du RAG (réussi dans la mesure ou on a RoPE)
+Enfin il faut améliorer l'efficactité du transfert entre les machines (POwerSGD) et faire baisser la RAM pour baisser ACCUM_STEPS et augmenter BatchSize. (réussi mois de 1s on tente de baisser le ACCUM_STEPS à . !!)
+
 Listes des améliorations pour la seconde version de Lyre :
     - augmentation data 14Go -> 19.2
     - RoPE pour remplacer pos_emb d'autant plus important pour du RAG qui demande une window size assez élevée pendant à l'inférence (fait)
     - RMSNorm remplacer à partir de GPT3 il me semble (fait)
     - SwiGLU (fait)
     - Gradient checkpointing (à faire pour baisser la VRAM)
-    - GQA pour gagner en ram + faire plus de têtes ?
+    - PowerSGD (fait)
+    -> nouveau problème de RAM pas envie de faire baisser le batch size solution
+        - implémenter GQA pour partager les têtes d'attention
 
-    - Il me semble que possibilité de compresser les gradients pour gaganer du temps sur réseau = PowerSGD
-
-    à voir ce que Claude m'a dit (pas forcemment de bon conseil)
-    - sdp_kernel est deprecié est ce que cela a un réel impact ?
-    
-    grep "use_gradient_checkpointing" models/lyre.py
-
-    find . -name "*.pyc" -delete
-    find . -name "__pycache__" -delete
-
-    [rank0]: Traceback (most recent call last):
-[rank0]:   File "/autofs/unitytravail/travail/hramillon/prog/Lyre/models/lyre.py", line 94, in <module>
-[rank0]:     total = sum(p.numel() for p in model.parameters())
-[rank0]:                                    ^^^^^
-[rank0]: NameError: name 'model' is not defined
-[rank0]:[W518 19:14:33.160986117 ProcessGroupNCCL.cpp:1250] Warning: WARNING: process group has NOT been destroyed before we destruct ProcessGroupNCCL. On normal program exit, the application should call destroy_process_group to ensure that any pending NCCL operations have finished in this process. In rare cases this process can exit before this point and block the progress of another member of the process group. This constraint has always been present,  but this warning has only been added since PyTorch 2.4 (function operator())
-E0518 19:14:34.007000 298846 torch/distributed/elastic/multiprocessing/api.py:869] failed (exitcode: 1) local_rank: 0 (pid: 298890) of binary: /autofs/unitytravail/travail/hramillon/prog/Lyre/venv/bin/python3
-Traceback (most recent call last):
-
-
-torchrun --nproc_per_node=1 --nnodes=3 --node_rank=0 --rdzv_id=lyre --rdzv_backend=c10d --rdzv_endpoint=10.0.104.4:29505 models/lyre.py 2>&1 | tee train.log
-
-cat train.log
+Il est clait que le principal avantage de cette IA est d'être en capacité de faire des phrases correctes cependant elle ne pourra pas comprendre des questions compliquées. Son utilité reposera donc principalement sur
+    - Un bon fine tuning pour lui faire faire excatement ce que l'on veut 
+    - Un très bon système de RAG qui réussit à récupérer les bonnes infortmations sur Internet/la discussion/info internes Ce RAG devra donc reposer sur une couche embedding assez puissante.
 """
 # FIX SYSTEME
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 
 # =============================================================================
 # HYPERPARAMÈTRES
 # =============================================================================
 #Pour Rag
+
 MAX_LEN          = 1024
 #vocab donnée par lyre_token.py
 VOCAB_SIZE       = 32768
@@ -80,8 +68,8 @@ cp corpus_encoded.bin /tmp/corpus_encoded.bin
 
 cp /tmp/checkpoint/latest_best.pt checkpoint/latest_best.pt
 
-torchrun --nproc_per_node=1 --nnodes=3 --node_rank=0 --rdzv_id=lyre --rdzv_backend=c10d --rdzv_endpoint=10.0.104.4:29505 models/lyre.py
-fuser -k 29505/tcp
+torchrun --nproc_per_node=1 --nnodes=3 --node_rank=0 --master_addr=10.0.104.4 --master_port=29505 models/lyre.py
+
 """
 BIN_FILE         = "ressources/corpus_encoded.bin"
 MODEL_SAVE_DIR   = "checkpoint/"
@@ -90,8 +78,10 @@ BATCH_SIZE_PER_GPU = 16
 # by increasing BATCH_SIZE_PER_GPU we should decrease it to prevent the models to diverge
 ACCUM_STEPS      = 32 
 
-SAVE_EVERY       = 10 * ACCUM_STEPS 
+SAVE_EVERY       = 100 * ACCUM_STEPS 
 RESUME_PATH      = os.path.join(MODEL_SAVE_DIR, "latest_best2.pt")
+
+CHECKPOINT_PATH      = os.path.join(MODEL_SAVE_DIR, "checks.pt")
 
 # =============================================================================
 # INIT DDP (NCCL)
@@ -146,6 +136,10 @@ dist.barrier(device_ids=[local_rank])
 # SwiGLU
 # ---------------
 
+# ---------------
+# SwiGLU
+# ---------------
+
 class SwiGLU(nn.Module):
     def __init__(self, embed_dim, ff_dim, dropout=0.1):
         super().__init__()
@@ -155,7 +149,9 @@ class SwiGLU(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.drop(self.w3(F.silu(self.w1(x)) * self.w2(x)))
+        gate = F.silu(self.w1(x), inplace=True)
+        gate.mul_(self.w2(x))
+        return self.drop(self.w3(gate))
 
 # ---------------
 # RMSNorm
@@ -186,58 +182,74 @@ def precompute_rope(head_dim, max_len, base=10000, device=None):
     return freqs.cos(), freqs.sin()
 
 def apply_rope(x, cos, sin):
-    # x shape : (B, n_heads, T, head_dim)
     T = x.shape[2]
-    # on prend les positions nécessaires
     cos, sin = cos[:T], sin[:T]
-
-    # sépare les paires de dimensions
+    
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
-
-    # rotation 2D
-    x_rot = torch.stack([
-        x1 * cos - x2 * sin,
-        x1 * sin + x2 * cos
-    ], dim=-1)
+    
+    # Calcul direct
+    out_even = x1 * cos - x2 * sin
+    out_odd = x1 * sin + x2 * cos
+    
+    # reconstruit sans allouer / problème de RAM
+    out = torch.empty_like(x)
+    out[..., ::2] = out_even
+    out[..., 1::2] = out_odd
+    
+    return out
 
     return x_rot.flatten(-2) 
 
 # casual masque les mots futurs (génération de texte)
 class CausalSelfAttention(nn.Module):
-    def __init__(self, embed_dim, n_heads, dropout=0.1):
+    def __init__(self, embed_dim, n_heads,n_kv_heads=4, dropout=0.1):
         super().__init__()
+        self.n_kv_heads = n_kv_heads
         #head dim  = 1024/16 =  64
         self.n_heads, self.head_dim = n_heads, embed_dim // n_heads
-        # au lieu de faire trois lignes pour Query, Key, Value :  on fait entrer un tenseur de taille embed dim on sort trois embed dim
+        self.n_rep      = n_heads // n_kv_heads
+        # (anvienne version) au lieu de faire trois lignes pour Query, Key, Value :  on fait entrer un tenseur de taille embed dim on sort trois embed dim
+        # (nouvelle QVA) q d'un coté kv de l'autre 
         # le proj concatène les résultats des différentes couches d'attention
         # dropout basique, régularisation simple en 0.1
-        self.qkv, self.proj, self.drop = nn.Linear(embed_dim, 3 * embed_dim, bias=False), nn.Linear(embed_dim, embed_dim), nn.Dropout(dropout)
+        self.q_proj  = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.kv_proj = nn.Linear(embed_dim, 2 * n_kv_heads * self.head_dim, bias=False)
+        self.proj    = nn.Linear(embed_dim, embed_dim)
+        self.drop    = nn.Dropout(dropout)
     def forward(self, x, cos, sin):
         # tenseur d'entrée x , divisée par son B(atch size) T(ime) =1024 C(hannel 1024)
         B, T, C = x.shape
         # créer des vues différentes pour Query, Key, View
-        q, k, v = self.qkv(x).split(C, dim=2)
+        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        kv = self.kv_proj(x).view(B, T, 2, self.n_kv_heads, self.head_dim)
+        k, v = kv.unbind(2)
         # view divise c en deux puis transpose B ,n_heads ,T, head_dim
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
         #RoPE
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
+        k = k.repeat_interleave(self.n_rep, dim=1)
+        v = v.repeat_interleave(self.n_rep, dim=1)
+
         # calcul en parallèle on multiplie la matrice q par la transposée k / on applique le  masque triangulaire inférieure
         ## Softmax ( Q.k^{T}/sqrt(d_k) + M) * V ou M est le masque causal et d_k = head dim = embed_dim//n_head  = 64
-        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=self.drop.p if self.training else 0.0, is_causal=True)
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.drop.p if self.training else 0.0,
+            is_causal=True
+        )
         return self.proj(out.transpose(1, 2).contiguous().view(B, T, C))
 
 class TransformerBlock(nn.Module):
-    def __init__(self, embed_dim, n_heads, ff_dim, dropout=0.1):
+    def __init__(self, embed_dim, n_heads, ff_dim, n_kv_heads, dropout=0.1):
         super().__init__()
         # on prépare les layers
         #attention
-        self.ln1, self.attn = RMSNorm(embed_dim), CausalSelfAttention(embed_dim, n_heads, dropout)
+        self.ln1, self.attn = RMSNorm(embed_dim), CausalSelfAttention(embed_dim, n_heads, n_kv_heads,dropout)
         # MLP
         self.ln2, self.ffn = RMSNorm(embed_dim),SwiGLU(embed_dim, ff_dim, dropout)
     def forward(self, x,cos, sin):
@@ -247,13 +259,13 @@ class TransformerBlock(nn.Module):
         return x + self.ffn(self.ln2(x))
 
 class Lyre(nn.Module):
-    def __init__(self, vocab_size, max_len, embed_dim, n_heads, ff_dim, n_blocks, dropout=0.1, use_gradient_checkpointing=True):
+    def __init__(self, vocab_size, max_len, embed_dim, n_heads, ff_dim, n_blocks, n_kv_heads, dropout=0.1, use_gradient_checkpointing=True):
         super().__init__()
         # token_emb : 32768 * 1024 pos_emb : remplacé par RoPE
         self.token_emb = nn.Embedding(vocab_size, embed_dim)
         self.drop = nn.Dropout(dropout)
         # block transformer 16 layers
-        self.blocks = nn.ModuleList([TransformerBlock(embed_dim, n_heads, ff_dim, dropout) for _ in range(n_blocks)])
+        self.blocks = nn.ModuleList([TransformerBlock(embed_dim, n_heads, ff_dim, n_kv_heads, dropout) for _ in range(n_blocks)])
         # normalisation  + MLP
         self.ln_f, self.head = RMSNorm(embed_dim), nn.Linear(embed_dim, vocab_size, bias=False)
         self.head.weight = self.token_emb.weight
@@ -287,7 +299,7 @@ class Lyre(nn.Module):
 # créer norte modèle
 model = Lyre(
     VOCAB_SIZE, MAX_LEN, EMBEDDING_DIM, N_HEADS,
-    FEED_FORWARD_DIM, N_BLOCKS, DROPOUT,
+    FEED_FORWARD_DIM, N_BLOCKS,N_KV_HEADS, DROPOUT,
     use_gradient_checkpointing=True
 ).to(device)
 
@@ -297,6 +309,7 @@ if is_chief:
     print(f"[ARCH] Layers: {N_BLOCKS} | Heads: {N_HEADS} | Embed: {EMBEDDING_DIM} | FF: {FEED_FORWARD_DIM}")
 
 # distributed data parallel pour entrainer sur plusieurs PC gradient dans des paquets de 50Mo pour que PowerSgd soit efficace
+#on fait un *2 donc on risque de mieux converger...
 model = DDP(model, device_ids=[local_rank], bucket_cap_mb=50)
 
 powersgd_state = powerSGD.PowerSGDState(
@@ -304,7 +317,7 @@ powersgd_state = powerSGD.PowerSGDState(
     matrix_approximation_rank=4,
     warm_start=True,
     use_error_feedback=True,
-    start_powerSGD_iter=100,
+    start_powerSGD_iter=10,
     min_compression_rate=2.0,
 )
 
@@ -409,7 +422,7 @@ for epoch in range(EPOCHS):
                 )
 
                 # SAUVEGARDE CONDITIONNELLE : Intervalle + Meilleure Loss à améliorer pas assez de sauvegarde en fin d'entrainement
-                if (step_in_epoch + 1) % SAVE_EVERY == 0 and current_loss_val < best_loss:
+                if current_loss_val < best_loss:
                     best_loss = current_loss_val
                     torch.save({
                         'step': step_in_epoch,
@@ -426,4 +439,19 @@ for epoch in range(EPOCHS):
                     print(f" >> [SAVE] Nouveau best à {best_loss:.4f} au step {step_in_epoch}")
 
 
+            if (step_in_epoch + 1) % SAVE_EVERY== 0 :
+                    current_loss = current_loss_val
+                    torch.save({
+                        'step': step_in_epoch,
+                        'model_state_dict': model.module.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'loss': current_loss,
+                        'powersgd_p': [p.cpu() for p in powersgd_state.p_memory_dict.values()],
+                        # Pareil pour Q
+                        'powersgd_q': [q.cpu() for q in powersgd_state.q_memory_dict.values()],
+                        # Le compteur de steps PowerSGD
+                        'powersgd_iter': powersgd_state.iter,
+                    }, CHECKPOINT_PATH)
+                    print(f" >> [SAVE] Checkpoint {current_loss:.4f} at {step_in_epoch}")
 dist.destroy_process_group()
