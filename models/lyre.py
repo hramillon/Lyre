@@ -12,6 +12,9 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 from torch.utils.checkpoint import checkpoint
 from torch.distributed.algorithms.ddp_comm_hooks import powerSGD_hook as powerSGD
 
+from archi import RMSNorm, SwiGLU, precompute_rope, apply_rope, TransformerBlock
+
+
 """
 L'objectif principale pour la seconde version de Lyre et quelle ait une meilleure perplexité pour éviter avoir des phrases plus cohérentes. d'après mes recerches rajouter des parametres n'est clairement pas suffisant( il faudrait en rajouter beaucoup ) soit dit en passant on peut augmenter la quantité de donnée sur laquelle est entrainée l'IA on passe donc de 14 à 20Go de données on peut aussi penser à soit faire une autre epoch soit entrainée sur en plus du opensubttles + une partie de CulturaX que je n'ai pas telechargé en français.
 le second objectif est d'être plus souple sur la window size ce que le mécanisme RoPE permet ce qui permettre d'améliorer l'efficatcité du RAG (réussi dans la mesure ou on a RoPE)
@@ -56,7 +59,7 @@ EPOCHS           = 1
 # pour le grouped Query Attention
 N_KV_HEADS = 4
 """
-dans version 2 en réalité c'est aussi utilse que ce que je pensais, aucune amélioration visible
+dans version 2 ça devient important le seul moment ou les GPU ne travail pas c'est durant la période de warmup du sgd et du save donc on essaie de faire ça en local pour le rendre indtant au lieu d'attendre 20s en passant par le réseau
 
 à absolument faire sur les trois machines 
 mkdir -p /tmp/checkpoint
@@ -72,7 +75,7 @@ torchrun --nproc_per_node=1 --nnodes=3 --node_rank=0 --master_addr=10.0.104.4 --
 
 """
 BIN_FILE         = "ressources/corpus_encoded.bin"
-MODEL_SAVE_DIR   = "checkpoint/"
+MODEL_SAVE_DIR   = "/tmp/checkpoint/"
 # memory issues ,20go for 8 by gpus is too small
 BATCH_SIZE_PER_GPU = 16
 # by increasing BATCH_SIZE_PER_GPU we should decrease it to prevent the models to diverge
@@ -131,76 +134,6 @@ dist.barrier(device_ids=[local_rank])
 # MODÈLE
 # =============================================================================
 
-
-# ---------------
-# SwiGLU
-# ---------------
-
-# ---------------
-# SwiGLU
-# ---------------
-
-class SwiGLU(nn.Module):
-    def __init__(self, embed_dim, ff_dim, dropout=0.1):
-        super().__init__()
-        self.w1 = nn.Linear(embed_dim, ff_dim, bias=False)
-        self.w2 = nn.Linear(embed_dim, ff_dim, bias=False)
-        self.w3 = nn.Linear(ff_dim, embed_dim, bias=False)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x):
-        gate = F.silu(self.w1(x), inplace=True)
-        gate.mul_(self.w2(x))
-        return self.drop(self.w3(gate))
-
-# ---------------
-# RMSNorm
-# ---------------
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return x * rms * self.weight
-
-# ---------------
-# RoPE
-# ---------------
-#head = 64
-def precompute_rope(head_dim, max_len, base=10000, device=None):
-    # une fréquence theta par paire de dimensions
-    theta = 1.0 / (base ** (
-        torch.arange(0, head_dim, 2, device=device).float() / head_dim
-    ))
-    # toutes les positions
-    positions = torch.arange(max_len, device=device).float()
-    # matrice (max_len, head_dim//2) angle de chaque position/dimension
-    freqs = torch.outer(positions, theta)
-    return freqs.cos(), freqs.sin()
-
-def apply_rope(x, cos, sin):
-    T = x.shape[2]
-    cos, sin = cos[:T], sin[:T]
-    
-    x1 = x[..., ::2]
-    x2 = x[..., 1::2]
-    
-    # Calcul direct
-    out_even = x1 * cos - x2 * sin
-    out_odd = x1 * sin + x2 * cos
-    
-    # reconstruit sans allouer / problème de RAM
-    out = torch.empty_like(x)
-    out[..., ::2] = out_even
-    out[..., 1::2] = out_odd
-    
-    return out
-
-    return x_rot.flatten(-2) 
-
 # casual masque les mots futurs (génération de texte)
 class CausalSelfAttention(nn.Module):
     def __init__(self, embed_dim, n_heads,n_kv_heads=4, dropout=0.1):
@@ -244,19 +177,7 @@ class CausalSelfAttention(nn.Module):
         )
         return self.proj(out.transpose(1, 2).contiguous().view(B, T, C))
 
-class TransformerBlock(nn.Module):
-    def __init__(self, embed_dim, n_heads, ff_dim, n_kv_heads, dropout=0.1):
-        super().__init__()
-        # on prépare les layers
-        #attention
-        self.ln1, self.attn = RMSNorm(embed_dim), CausalSelfAttention(embed_dim, n_heads, n_kv_heads,dropout)
-        # MLP
-        self.ln2, self.ffn = RMSNorm(embed_dim),SwiGLU(embed_dim, ff_dim, dropout)
-    def forward(self, x,cos, sin):
-        # Calcul de l'attention sur l'entrée normalisée
-        x = x + self.attn(self.ln1(x), cos, sin)
-        # Calcul du FFN sur l'entrée normalisée
-        return x + self.ffn(self.ln2(x))
+TransformerBlock(..., attn_class=BidirectionalAttention)
 
 class Lyre(nn.Module):
     def __init__(self, vocab_size, max_len, embed_dim, n_heads, ff_dim, n_blocks, n_kv_heads, dropout=0.1, use_gradient_checkpointing=True):
@@ -316,11 +237,12 @@ powersgd_state = powerSGD.PowerSGDState(
     process_group=dist.group.WORLD,
     matrix_approximation_rank=4,
     warm_start=True,
-    use_error_feedback=True,
+    use_error_feedback=False,
     start_powerSGD_iter=10,
     min_compression_rate=2.0,
 )
 
+powersgd_state.error_dict = {}
 model.register_comm_hook(
     state=powersgd_state,
     hook=powerSGD.powerSGD_hook,
@@ -349,23 +271,18 @@ best_loss = float('inf')
 # reprise de l'entrainement
 if os.path.exists(RESUME_PATH):
     map_location = {'cuda:%d' % 0: 'cuda:%d' % local_rank}
-    checkpoint = torch.load(RESUME_PATH, map_location=map_location)
+    ckpt = torch.load(RESUME_PATH, map_location=map_location)
     
-    model.module.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    start_step = checkpoint['step'] + 1
-    best_loss  = checkpoint['loss']
+    model.module.load_state_dict(ckpt['model_state_dict'])
+    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+    scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+    start_step = ckpt['step'] + 1
+    best_loss  = ckpt['loss']
 
     # PowerSGD
-    if 'powersgd_iter' in checkpoint:
-        powersgd_state.iter = checkpoint['powersgd_iter']
-        if checkpoint['powersgd_p']:
-            for p_saved, p_curr in zip(checkpoint['powersgd_p'], powersgd_state.p_memory_dict.values()):
-                p_curr.copy_(p_saved.to(device))
-        if checkpoint['powersgd_q']:
-            for q_saved, q_curr in zip(checkpoint['powersgd_q'], powersgd_state.q_memory_dict.values()):
-                q_curr.copy_(q_saved.to(device))
+    if 'powersgd_iter' in ckpt:
+        powersgd_state.iter = ckpt['powersgd_iter']
+        powersgd_state.error_dict = {}
 
     if is_chief:
         print(f"[INFO] Resume au step {start_step} (Loss: {best_loss:.4f})")
@@ -430,28 +347,20 @@ for epoch in range(EPOCHS):
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict(),
                         'loss': best_loss,
-                        'powersgd_p': [p.cpu() for p in powersgd_state.p_memory_dict.values()],
-                        # Pareil pour Q
-                        'powersgd_q': [q.cpu() for q in powersgd_state.q_memory_dict.values()],
-                        # Le compteur de steps PowerSGD
                         'powersgd_iter': powersgd_state.iter,
                     }, RESUME_PATH)
                     print(f" >> [SAVE] Nouveau best à {best_loss:.4f} au step {step_in_epoch}")
 
 
-            if (step_in_epoch + 1) % SAVE_EVERY== 0 :
-                    current_loss = current_loss_val
-                    torch.save({
-                        'step': step_in_epoch,
-                        'model_state_dict': model.module.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict(),
-                        'loss': current_loss,
-                        'powersgd_p': [p.cpu() for p in powersgd_state.p_memory_dict.values()],
-                        # Pareil pour Q
-                        'powersgd_q': [q.cpu() for q in powersgd_state.q_memory_dict.values()],
-                        # Le compteur de steps PowerSGD
-                        'powersgd_iter': powersgd_state.iter,
-                    }, CHECKPOINT_PATH)
-                    print(f" >> [SAVE] Checkpoint {current_loss:.4f} at {step_in_epoch}")
+                if (step_in_epoch + 1) % SAVE_EVERY== 0 :
+                        current_loss = current_loss_val
+                        torch.save({
+                            'step': step_in_epoch,
+                            'model_state_dict': model.module.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'scheduler_state_dict': scheduler.state_dict(),
+                            'loss': current_loss,
+                            'powersgd_iter': powersgd_state.iter,
+                        }, CHECKPOINT_PATH)
+                        print(f" >> [SAVE] Checkpoint {current_loss:.4f} at {step_in_epoch}")
 dist.destroy_process_group()
