@@ -7,7 +7,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         # on prépare les layers
         #attention
-        self.ln1, = RMSNorm(embed_dim)
+        self.ln1 = RMSNorm(embed_dim)
         self.attn = attn_class(embed_dim, n_heads, n_kv_heads, dropout)
         # MLP
         self.ln2, self.ffn = RMSNorm(embed_dim),SwiGLU(embed_dim, ff_dim, dropout)

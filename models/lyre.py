@@ -1,6 +1,7 @@
 import os
 import math
 import time
+import sys, os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,6 +15,8 @@ from torch.distributed.algorithms.ddp_comm_hooks import powerSGD_hook as powerSG
 
 from archi import RMSNorm, SwiGLU, precompute_rope, apply_rope, TransformerBlock
 
+print("DEBUT DU SCRIPT 1", flush=True)
+sys.stdout.flush()
 
 """
 L'objectif principale pour la seconde version de Lyre et quelle ait une meilleure perplexité pour éviter avoir des phrases plus cohérentes. d'après mes recerches rajouter des parametres n'est clairement pas suffisant( il faudrait en rajouter beaucoup ) soit dit en passant on peut augmenter la quantité de donnée sur laquelle est entrainée l'IA on passe donc de 14 à 20Go de données on peut aussi penser à soit faire une autre epoch soit entrainée sur en plus du opensubttles + une partie de CulturaX que je n'ai pas telechargé en français.
@@ -73,9 +76,10 @@ cp /tmp/checkpoint/latest_best.pt checkpoint/latest_best.pt
 
 torchrun --nproc_per_node=1 --nnodes=3 --node_rank=0 --master_addr=10.0.104.4 --master_port=29505 models/lyre.py
 
+
 """
 BIN_FILE         = "ressources/corpus_encoded.bin"
-MODEL_SAVE_DIR   = "/tmp/checkpoint/"
+MODEL_SAVE_DIR   = "checkpoint/"
 # memory issues ,20go for 8 by gpus is too small
 BATCH_SIZE_PER_GPU = 16
 # by increasing BATCH_SIZE_PER_GPU we should decrease it to prevent the models to diverge
@@ -130,6 +134,9 @@ def make_dataloader(dataset, batch_size, world_size, rank):
 dataset = CorpusDataset(BIN_FILE, MAX_LEN, VOCAB_SIZE)
 dist.barrier(device_ids=[local_rank])
 
+print("DEBUT DU SCRIPT 1", flush=True)
+sys.stdout.flush()
+
 # =============================================================================
 # MODÈLE
 # =============================================================================
@@ -177,8 +184,6 @@ class CausalSelfAttention(nn.Module):
         )
         return self.proj(out.transpose(1, 2).contiguous().view(B, T, C))
 
-TransformerBlock(..., attn_class=BidirectionalAttention)
-
 class Lyre(nn.Module):
     def __init__(self, vocab_size, max_len, embed_dim, n_heads, ff_dim, n_blocks, n_kv_heads, dropout=0.1, use_gradient_checkpointing=True):
         super().__init__()
@@ -186,7 +191,7 @@ class Lyre(nn.Module):
         self.token_emb = nn.Embedding(vocab_size, embed_dim)
         self.drop = nn.Dropout(dropout)
         # block transformer 16 layers
-        self.blocks = nn.ModuleList([TransformerBlock(embed_dim, n_heads, ff_dim, n_kv_heads, dropout) for _ in range(n_blocks)])
+        self.blocks = nn.ModuleList([TransformerBlock(embed_dim, n_heads, ff_dim, n_kv_heads, dropout,CausalSelfAttention) for _ in range(n_blocks)])
         # normalisation  + MLP
         self.ln_f, self.head = RMSNorm(embed_dim), nn.Linear(embed_dim, vocab_size, bias=False)
         self.head.weight = self.token_emb.weight
@@ -217,6 +222,9 @@ class Lyre(nn.Module):
 # =============================================================================
 # SETUP & REPRISE
 # =============================================================================
+print("DEBUT DU SCRIPT", flush=True)
+sys.stdout.flush()
+
 # créer norte modèle
 model = Lyre(
     VOCAB_SIZE, MAX_LEN, EMBEDDING_DIM, N_HEADS,

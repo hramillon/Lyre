@@ -61,10 +61,8 @@ CHECKPOINT_PATH      = os.path.join(MODEL_SAVE_DIR, "checks.pt")
 torch.cuda.set_device(local_rank)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-if is_chief:
-    print(f"[INFO] {world_size} GPU(s), Ada 4000. Accumulation: {ACCUM_STEPS}")
-    if not os.path.exists(MODEL_SAVE_DIR):
-        os.makedirs(MODEL_SAVE_DIR)
+if not os.path.exists(MODEL_SAVE_DIR):
+    os.makedirs(MODEL_SAVE_DIR)
 
 # =============================================================================
 # DATASET
@@ -94,7 +92,7 @@ def make_dataloader(dataset, batch_size):
 # =============================================================================
 
 # rien à changer en comparaison à Lyre si vous voulez comprendre lire commentaires de lyre.py à la class
-class CausalSelfAttention(nn.Module):
+class BidirectionalAttention(nn.Module):
     def __init__(self, embed_dim, n_heads, n_kv_heads=4, dropout=0.1):
         super().__init__()
         self.n_kv_heads = n_kv_heads
