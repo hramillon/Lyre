@@ -63,20 +63,19 @@ def precompute_rope(head_dim, max_len, base=10000, device=None):
 
 def apply_rope(x, cos, sin):
     T = x.shape[2]
-    cos, sin = cos[:T], sin[:T]
+    
+    # Aligne parfaitement les dimensions [1, 1, T, head_dim]
+    cos_view = cos[:T].unsqueeze(0).unsqueeze(0)
+    sin_view = sin[:T].unsqueeze(0).unsqueeze(0)
     
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
     
-    # Calcul direct
-    out_even = x1 * cos - x2 * sin
-    out_odd = x1 * sin + x2 * cos
+    out_even = x1 * cos_view - x2 * sin_view
+    out_odd = x1 * sin_view + x2 * cos_view
     
-    # reconstruit sans allouer / problème de RAM
     out = torch.empty_like(x)
     out[..., ::2] = out_even
     out[..., 1::2] = out_odd
     
     return out
-
-    return x_rot.flatten(-2) 

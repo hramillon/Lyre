@@ -15,7 +15,6 @@ from torch.distributed.algorithms.ddp_comm_hooks import powerSGD_hook as powerSG
 
 from archi import RMSNorm, SwiGLU, precompute_rope, apply_rope, TransformerBlock
 
-print("DEBUT DU SCRIPT 1", flush=True)
 sys.stdout.flush()
 
 """
@@ -85,9 +84,10 @@ BATCH_SIZE_PER_GPU = 16
 # by increasing BATCH_SIZE_PER_GPU we should decrease it to prevent the models to diverge
 ACCUM_STEPS      = 32 
 
-SAVE_EVERY       = 100 * ACCUM_STEPS 
-RESUME_PATH      = os.path.join(MODEL_SAVE_DIR, "latest_best2.pt")
+SAVE_EVERY       = 20 * ACCUM_STEPS 
+RESUME_PATH      = os.path.join(MODEL_SAVE_DIR, "checks.pt")
 
+BEST_PATH      = os.path.join(MODEL_SAVE_DIR, "latest_best2.pt")
 CHECKPOINT_PATH      = os.path.join(MODEL_SAVE_DIR, "checks.pt")
 
 # =============================================================================
@@ -134,7 +134,6 @@ def make_dataloader(dataset, batch_size, world_size, rank):
 dataset = CorpusDataset(BIN_FILE, MAX_LEN, VOCAB_SIZE)
 dist.barrier(device_ids=[local_rank])
 
-print("DEBUT DU SCRIPT 1", flush=True)
 sys.stdout.flush()
 
 # =============================================================================
@@ -222,7 +221,6 @@ class Lyre(nn.Module):
 # =============================================================================
 # SETUP & REPRISE
 # =============================================================================
-print("DEBUT DU SCRIPT", flush=True)
 sys.stdout.flush()
 
 # créer norte modèle
@@ -338,10 +336,12 @@ for epoch in range(EPOCHS):
                 speed = elapsed / steps_done_session if steps_done_session > 0 else 0
                 remaining_steps = total_steps - current_total_step
                 eta = remaining_steps * speed
+                current_lr = scheduler.get_last_lr()[0]
 
                 print(
                     f"Step {current_total_step}/{total_steps} | "
                     f"Loss: {current_loss_val:.4f} | "
+                    f"LR: {current_lr:.2e} | "
                     f"Passé: {time.strftime('%H:%M:%S', time.gmtime(elapsed))} | "
                     f"ETA: {time.strftime('%H:%M:%S', time.gmtime(eta))}"
                 )
@@ -356,7 +356,7 @@ for epoch in range(EPOCHS):
                         'scheduler_state_dict': scheduler.state_dict(),
                         'loss': best_loss,
                         'powersgd_iter': powersgd_state.iter,
-                    }, RESUME_PATH)
+                    }, BEST_PATH)
                     print(f" >> [SAVE] Nouveau best à {best_loss:.4f} au step {step_in_epoch}")
 
 
