@@ -48,10 +48,22 @@ As you can see it's a very useful tool if we want to compare every word with eve
 
 To improve the speed of our training and generation we can directly compute a matrix product between all the words of our sentence. We multiply the key vectors and the query vectors of each word directly giving us a matrix of size $T \times T$ (where $T$ is the sequence length). However we put a mask on this matrix such that a query vector cannot be compared to the next words of the sentence. With that the model is trained to find the next word only using the previous ones.
 
-![Causal Mask](mf_ress/causalmask.png)
+![Causal Mask](md_ress/causalmask.png)
 *from https://medium.com/@sanjjam/beginners-guide-to-causal-attention-b2e3fa9bc762*
 
 #### Transformers
+
+**Transformer Block**
+
+A Transformer block takes as input: Queries, Keys, and Values. They go through a multi-head attention layer and are then summed with the input shortcut to prevent gradient vanishing. 
+After being normalized, the vectors go through a feed-forward layer. The goal of this layer is to extract higher-level features as we go deeper into the model.
+
+![Block Transformer](mf_ress/blocktransformer.png)
+*from https://www.researchgate.net/figure/The-structure-of-a-Transformer-Block_fig1_336224014*
+
+**Positional encoding**
+
+Finally, we have to introduce a mechanism to give importance to the position of every word in the sentence, since the multi-head attention layer does not account for order. To do that, we simply use a positional embedding layer which converts a token position into a learned vector.
 
 #### GPT2 Architecture
 
