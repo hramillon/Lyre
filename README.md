@@ -79,19 +79,9 @@ Instead of learning a vector for every position, we compute it directly on the q
 Let's introduce it in a more mathematical way:
 We want $q \cdot k$ to encode the position $m-n$. To do that, we use the angle $\theta$. We do that for the $d/2$ pairs, where $d$ is the dimension.
 
-$$
-\begin{pmatrix} q'_1 \\ q'_2 \end{pmatrix}
-=
-\begin{pmatrix} \cos(m\theta) & -\sin(m\theta) \\ \sin(m\theta) & \cos(m\theta) \end{pmatrix}
-\begin{pmatrix} q_1 \\ q_2 \end{pmatrix}
-$$
+$$\begin{pmatrix} q'_1 \\ q'_2 \end{pmatrix} = \begin{pmatrix} \cos(m\theta) & -\sin(m\theta) \\ \sin(m\theta) & \cos(m\theta) \end{pmatrix} \begin{pmatrix} q_1 \\ q_2 \end{pmatrix}$$
 
-$$
-\begin{pmatrix} k'_1 \\ k'_2 \end{pmatrix}
-=
-\begin{pmatrix} \cos(n\theta) & -\sin(n\theta) \\ \sin(n\theta) & \cos(n\theta) \end{pmatrix}
-\begin{pmatrix} k_1 \\ k_2 \end{pmatrix}
-$$
+$$\begin{pmatrix} k'_1 \\ k'_2 \end{pmatrix} = \begin{pmatrix} \cos(n\theta) & -\sin(n\theta) \\ \sin(n\theta) & \cos(n\theta) \end{pmatrix} \begin{pmatrix} k_1 \\ k_2 \end{pmatrix}$$
 
 In our code, this part is done by `precompute_rope` in `archi.py`.
 
