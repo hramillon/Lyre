@@ -49,6 +49,7 @@ As you can see it's a very useful tool if we want to compare every word with eve
 To improve the speed of our training and generation we can directly compute a matrix product between all the words of our sentence. We multiply the key vectors and the query vectors of each word directly giving us a matrix of size $T \times T$ (where $T$ is the sequence length). However we put a mask on this matrix such that a query vector cannot be compared to the next words of the sentence. With that the model is trained to find the next word only using the previous ones.
 
 ![Causal Mask](md_ress/causalmask.png)
+
 *from https://medium.com/@sanjjam/beginners-guide-to-causal-attention-b2e3fa9bc762*
 
 #### Transformers
@@ -58,22 +59,58 @@ To improve the speed of our training and generation we can directly compute a ma
 A Transformer block takes as input: Queries, Keys, and Values. They go through a multi-head attention layer and are then summed with the input shortcut to prevent gradient vanishing. 
 After being normalized, the vectors go through a feed-forward layer. The goal of this layer is to extract higher-level features as we go deeper into the model.
 
-![Block Transformer](mf_ress/blocktransformer.png)
+![Block Transformer](md_ress/blocktransformer.png)
 *from https://www.researchgate.net/figure/The-structure-of-a-Transformer-Block_fig1_336224014*
 
 **Positional encoding**
 
 Finally, we have to introduce a mechanism to give importance to the position of every word in the sentence, since the multi-head attention layer does not account for order. To do that, we simply use a positional embedding layer which converts a token position into a learned vector.
 
-#### GPT2 Architecture
-
 ### Improvements
+
+To increase the performance per parameters, and particularlt to increase the batch size and the use of Vram, we introduces few modifications. Here it is the more important ones.
 
 #### RoPE
 
+This system is replacing the positional embedding layer. The RoPE system comes from this article [RoFormer: Enhanced Transformer with Rotary Position Embedding](https://arxiv.org/pdf/2104.09864).
+
+Instead of learning a vector for every position, we compute it directly on the queries and keys before the computation of the attention. Let's give a hint of what we want to achieve. If we rotate the vector $q$ proportionally to its position $m$, and if we do exactly the same thing with the vector $k$ with its position $n$, then $q \cdot k$ should encode the relative position $m-n$. This is exactly what we want: the system learns its position directly from the vectors $q$ and $k$.
+
+Let's introduce it in a more mathematical way:
+We want $q \cdot k$ to encode the position $m-n$. To do that, we use the angle $\theta$. We do that for the $d/2$ pairs, where $d$ is the dimension.
+
+$$
+\begin{pmatrix} q'_1 \\ q'_2 \end{pmatrix}
+=
+\begin{pmatrix} \cos(m\theta) & -\sin(m\theta) \\ \sin(m\theta) & \cos(m\theta) \end{pmatrix}
+\begin{pmatrix} q_1 \\ q_2 \end{pmatrix}
+$$
+
+$$
+\begin{pmatrix} k'_1 \\ k'_2 \end{pmatrix}
+=
+\begin{pmatrix} \cos(n\theta) & -\sin(n\theta) \\ \sin(n\theta) & \cos(n\theta) \end{pmatrix}
+\begin{pmatrix} k_1 \\ k_2 \end{pmatrix}
+$$
+
+In our code, this part is done by `precompute_rope` in `archi.py`.
+
+Now that we have that, we can apply it to encode the relative position:
+
+$$
+q' \cdot k' = (q_1 k_1 + q_2 k_2) \cos((m-n)\theta) + (q_1 k_2 - q_2 k_1) \sin((m-n)\theta)
+$$
+
+RoPE has several advantages; one of them is the fact that we can train our model on `MAX_LEN`, but at inference, we can increase this value to handle more context.
+
 #### SwiGLU
 
+To understand the activation function SwiGLU we have to understand two things : GLU
+
+
 #### RMSNorm
+
+#### GQA
 
 ---
 
