@@ -95,8 +95,36 @@ RoPE has several advantages; one of them is the fact that we can train our model
 
 #### SwiGLU
 
-To understand the activation function SwiGLU we have to understand two things : GLU
+To understand the activation function SwiGLU, we have to understand two things: GLU and Swish.
 
+*GLU - Gated Linear Unit*
+
+This activation function is mostly used in NLP and it's inspired by the gating mechanisms we can find in LSTMs and GRUs.
+Thus, the goal is to filter a part of the data and to keep the other part intact. To do that, we have to split it like that:
+
+$$GLU(x) = (x \cdot W_1 + b) \otimes \sigma(x \cdot W_2 + c)$$
+
+![Glu function](md_ress/glu.png)
+*from https://medium.com/@sanket.nadargi1/gated-linear-unit-1622bf8e3ce7*
+
+*Swish*
+
+is an activation function defined by:
+
+$$Swish(x) = x \cdot \sigma(x)$$
+
+The function is like ReLU but negative for $x < 0$.
+
+![Swish function](md_ress/swish.jpeg)
+*from https://www.geeksforgeeks.org/machine-learning/ml-swish-function-by-google-in-keras/*
+
+*SwiGLU*
+
+Now we merge both:
+
+$$SwiGLU(x) = (x \cdot W_1 + b) \otimes Swish(x \cdot W_2 + c)$$
+
+$$SwiGLU(x) = (x \cdot W_1 + b) \otimes (\sigma(x \cdot W_2 + c) \cdot (x \cdot W_2 + c))$$
 
 #### RMSNorm
 
