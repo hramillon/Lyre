@@ -128,6 +128,30 @@ $$SwiGLU(x) = (x \cdot W_1 + b) \otimes (\sigma(x \cdot W_2 + c) \cdot (x \cdot 
 
 #### RMSNorm
 
+From [Root Mean Square Layer Normalization](https://arxiv.org/pdf/1910.07467)
+
+The goal of the normalization layer is to prevent gradient explosion or gradient vanishing by rescaling (variance 1) and recentering (mean 0). RMSNorm is another normalization layer which tries to be simpler and faster by just rescaling.
+
+The LayerNorm looks like:
+
+$$
+LayerNorm(x_i) = \frac{x_i - \mu}{\sigma} \cdot \gamma_i + \beta_i
+$$
+
+Here, $\mu$ and $\sigma$ are computed over every dimension, and $\gamma_i$ and $\beta_i$ are the learned parameters.
+
+Zhang and Sennrich observed that the division by the norm stabilizes the training, not the subtraction. Thus, they propose removing the computation of the average and just computing the root mean square.
+
+$$
+RMS(x) = \sqrt{\frac{1}{d} \sum_{i=1}^{d} x_i^2}
+$$
+
+$$
+RMSNorm(x_i) = \frac{x_i}{RMS(x)} \gamma_i
+$$
+
+We have to learn fewer parameters thanks to this technique.
+
 #### GQA
 
 ---
