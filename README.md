@@ -154,6 +154,22 @@ We have to learn fewer parameters thanks to this technique.
 
 #### GQA
 
+At the beginning, when we started to scale our architectures, we used MHA (Multi-Head Attention). Each head has its own matrices (Q), (K), and (V). However, the (K) and (V) matrices have to be stored during the whole generation process, which can be costly in memory.
+
+*MQA, Multi-Query Attention*
+
+A first idea, a very radical solution proposed in 2019 by Noam Shazeer in [One Write-Head Is All You Need](https://arxiv.org/pdf/1911.02150), was to share the same (K) and (V) for every (Q). However, performance can be impacted.
+
+A solution is [GQA](https://arxiv.org/pdf/2305.13245) (Grouped Query Attention). It groups a certain number of (K) and (V) matrices for a certain number of (Q) matrices. In our case, we have *N_KV_HEADS* = 4, so every (K)-(V) pair is associated with four query matrices.
+
+For the attention mechanism, there is now a small difference in the equation:
+
+$$
+Attention(Q_i, K_g, V_g) = softmax\left(\frac{Q_i K_g^{T}}{\sqrt{d_k}}\right)V_g
+$$
+
+where (i) is the query index and (g) is the group index.
+
 ---
 
 ## RAG
