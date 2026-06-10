@@ -4,6 +4,15 @@
 
 ## How to use it
 
+Install the dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+to use it you can try it on Hugging face :
+
+https://huggingface.co/Hramillon/lyre
+
 ---
 
 ## how it works
@@ -180,3 +189,11 @@ where (i) is the query index and (g) is the group index.
 
 ---
 ## Summary of my choices
+
+* **Max length:** 1024. With RoPE, this is enough to support a small RAG system and remember some previous questions while keeping the memory requirements reasonable.
+* **Vocabulary size:** 32,768, obtained using the `lyre_token.py` script, which uses BPE tokenization.
+* **Embedding dimension:** 1024, the same value used in GPT-2. This provides a good balance between model capacity and computational cost.
+* **N_blocks / N_heads:** 16. $d_{model}$/16 = 64, stadard choice, besides, this power-of-two value allows us to stay close to our target size of 200–300 million parameters.
+* **FFD:** 2752, following the common practice of using approximately ( \frac{2}{3} \times 4096 ).
+* **Dropout:** 0.1. Values reported in the literature are typically between 0.1 and 0.3.
+* **N_KV_HEADS:** 4, following the value used in Mistral's GQA architecture.
